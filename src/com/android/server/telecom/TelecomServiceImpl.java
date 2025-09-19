@@ -43,6 +43,7 @@ import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ParceledListSlice;
 import android.content.pm.ResolveInfo;
+import android.graphics.drawable.Icon;
 import android.net.Uri;
 import android.os.Binder;
 import android.os.Build;
@@ -54,6 +55,7 @@ import android.provider.Settings;
 import android.telecom.Log;
 import android.telecom.PhoneAccount;
 import android.telecom.PhoneAccountHandle;
+import android.telecom.StatusHints;
 import android.telecom.TelecomAnalytics;
 import android.telecom.TelecomManager;
 import android.telecom.VideoProfile;
@@ -600,6 +602,9 @@ public class TelecomServiceImpl {
                                     .setGroupId(null)
                                     .build();
                         }
+
+                        // Validate the profile boundary of the given image URI.
+                        validateAccountIconUserBoundary(account.getIcon());
 
                         final long token = Binder.clearCallingIdentity();
                         try {
@@ -2752,6 +2757,22 @@ public class TelecomServiceImpl {
                 .EXTRA_DEFAULT_CALL_SCREENING_APP_COMPONENT_NAME, componentName);
             intent.setPackage(broadcastComponentName.getPackageName());
             mContext.sendBroadcast(intent);
+        }
+    }
+
+    private void validateAccountIconUserBoundary(Icon icon) {
+        // Refer to Icon#getUriString for context. The URI string is invalid for icons of
+        // incompatible types.
+        if (icon != null && (icon.getType() == Icon.TYPE_URI
+                || icon.getType() == Icon.TYPE_URI_ADAPTIVE_BITMAP)) {
+            int callingUserId = UserHandle.getCallingUserId();
+            int requestingUserId = StatusHints.getUserIdFromAuthority(
+                    icon.getUri().getAuthority(), callingUserId);
+            if(callingUserId != requestingUserId) {
+                // If we are transcending the profile boundary, throw an error.
+                throw new IllegalArgumentException("Attempting to register a phone account with"
+                        + " an image icon belonging to another user.");
+            }
         }
     }
 }

@@ -23,6 +23,7 @@ import android.app.AppOpsManager;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.pm.PackageManager;
+import android.graphics.drawable.Icon;
 import android.net.Uri;
 import android.os.Binder;
 import android.os.Bundle;
@@ -39,6 +40,7 @@ import android.telecom.DisconnectCause;
 import android.telecom.GatewayInfo;
 import android.telecom.Log;
 import android.telecom.Logging.Session;
+import android.telecom.Logging.Runnable;
 import android.telecom.ParcelableConference;
 import android.telecom.ParcelableConnection;
 import android.telecom.PhoneAccountHandle;
@@ -62,6 +64,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.Objects;
 
 /**
@@ -75,6 +83,11 @@ public class ConnectionServiceWrapper extends ServiceBinder implements
         ConnectionServiceFocusManager.ConnectionServiceFocus {
 
     private static final String TELECOM_ABBREVIATION = "cast";
+    private static final long SERVICE_BINDING_TIMEOUT = 15000L;
+    private ScheduledExecutorService mScheduledExecutor =
+            Executors.newSingleThreadScheduledExecutor();
+    // Pre-allocate space for 2 calls; realistically thats all we should ever need (tm)
+    private final Map<Call, ScheduledFuture<?>> mScheduledFutureMap = new ConcurrentHashMap<>(2);
 
     private final class Adapter extends IConnectionServiceAdapter.Stub {
 
@@ -83,10 +96,23 @@ public class ConnectionServiceWrapper extends ServiceBinder implements
                 ParcelableConnection connection, Session.Info sessionInfo) {
             Log.startSession(sessionInfo, LogUtils.Sessions.CSW_HANDLE_CREATE_CONNECTION_COMPLETE,
                     mPackageAbbreviation);
+            UserHandle callingUserHandle = Binder.getCallingUserHandle();
             long token = Binder.clearCallingIdentity();
             try {
                 synchronized (mLock) {
                     logIncoming("handleCreateConnectionComplete %s", callId);
+                    Call call = mCallIdMapper.getCall(callId);
+                    if (call != null && mScheduledFutureMap.containsKey(call)) {
+                        ScheduledFuture<?> existingTimeout = mScheduledFutureMap.get(call);
+                        existingTimeout.cancel(false /* cancelIfRunning */);
+                        mScheduledFutureMap.remove(call);
+                    }
+                    // Check status hints image for cross user access
+                    if (connection.getStatusHints() != null) {
+                        Icon icon = connection.getStatusHints().getIcon();
+                        connection.getStatusHints().setIcon(StatusHints.
+                                validateAccountIconUserBoundary(icon, callingUserHandle));
+                    }
                     ConnectionServiceWrapper.this
                             .handleCreateConnectionComplete(callId, request, connection);
 
@@ -114,10 +140,23 @@ public class ConnectionServiceWrapper extends ServiceBinder implements
                 ParcelableConference conference, Session.Info sessionInfo) {
             Log.startSession(sessionInfo, LogUtils.Sessions.CSW_HANDLE_CREATE_CONNECTION_COMPLETE,
                     mPackageAbbreviation);
+            UserHandle callingUserHandle = Binder.getCallingUserHandle();
             long token = Binder.clearCallingIdentity();
             try {
                 synchronized (mLock) {
                     logIncoming("handleCreateConferenceComplete %s", callId);
+                    Call call = mCallIdMapper.getCall(callId);
+                    if (call != null && mScheduledFutureMap.containsKey(call)) {
+                        ScheduledFuture<?> existingTimeout = mScheduledFutureMap.get(call);
+                        existingTimeout.cancel(false /* cancelIfRunning */);
+                        mScheduledFutureMap.remove(call);
+                    }
+                    // Check status hints image for cross user access
+                    if (conference.getStatusHints() != null) {
+                        Icon icon = conference.getStatusHints().getIcon();
+                        conference.getStatusHints().setIcon(StatusHints.
+                                validateAccountIconUserBoundary(icon, callingUserHandle));
+                    }
                     ConnectionServiceWrapper.this
                             .handleCreateConferenceComplete(callId, request, conference);
 
@@ -482,6 +521,14 @@ public class ConnectionServiceWrapper extends ServiceBinder implements
             Log.startSession(sessionInfo, LogUtils.Sessions.CSW_ADD_CONFERENCE_CALL,
                     mPackageAbbreviation);
 
+            UserHandle callingUserHandle = Binder.getCallingUserHandle();
+            // Check status hints image for cross user access
+            if (parcelableConference.getStatusHints() != null) {
+                Icon icon = parcelableConference.getStatusHints().getIcon();
+                parcelableConference.getStatusHints().setIcon(StatusHints.
+                        validateAccountIconUserBoundary(icon, callingUserHandle));
+            }
+
             if (parcelableConference.getConnectElapsedTimeMillis() != 0
                     && mContext.checkCallingOrSelfPermission(MODIFY_PHONE_STATE)
                             != PackageManager.PERMISSION_GRANTED) {
@@ -727,10 +774,17 @@ public class ConnectionServiceWrapper extends ServiceBinder implements
         public void setStatusHints(String callId, StatusHints statusHints,
                 Session.Info sessionInfo) {
             Log.startSession(sessionInfo, "CSW.sSH", mPackageAbbreviation);
+            UserHandle callingUserHandle = Binder.getCallingUserHandle();
             long token = Binder.clearCallingIdentity();
             try {
                 synchronized (mLock) {
                     logIncoming("setStatusHints %s %s", callId, statusHints);
+                    // Check status hints image for cross user access
+                    if (statusHints != null) {
+                        Icon icon = statusHints.getIcon();
+                        statusHints.setIcon(StatusHints.validateAccountIconUserBoundary(
+                                icon, callingUserHandle));
+                    }
                     Call call = mCallIdMapper.getCall(callId);
                     if (call != null) {
                         call.setStatusHints(statusHints);
@@ -962,6 +1016,14 @@ public class ConnectionServiceWrapper extends ServiceBinder implements
                                     connection.getCallDirection(),
                                     connection.getCallerNumberVerificationStatus());
                         }
+
+                        // Check status hints image for cross user access
+                        if (connection.getStatusHints() != null) {
+                            Icon icon = connection.getStatusHints().getIcon();
+                            connection.getStatusHints().setIcon(StatusHints.
+                                    validateAccountIconUserBoundary(icon, userHandle));
+                        }
+
                         // Check to see if this Connection has already been added.
                         Call alreadyAddedConnection = mCallsManager
                                 .getAlreadyAddedConnection(connectIdToCheck);
@@ -1222,7 +1284,8 @@ public class ConnectionServiceWrapper extends ServiceBinder implements
      * @param context The context.
      * @param userHandle The {@link UserHandle} to use when binding.
      */
-    ConnectionServiceWrapper(
+    @VisibleForTesting
+    public ConnectionServiceWrapper(
             ComponentName componentName,
             ConnectionServiceRepository connectionServiceRepository,
             PhoneAccountRegistrar phoneAccountRegistrar,
@@ -1318,7 +1381,36 @@ public class ConnectionServiceWrapper extends ServiceBinder implements
                         .setParticipants(call.getParticipants())
                         .setIsAdhocConferenceCall(call.isAdhocConferenceCall())
                         .build();
-
+                Runnable r = new Runnable("CSW.cC", mLock) {
+                    @Override
+                    public void loggedRun() {
+                        if (!call.isCreateConnectionComplete()) {
+                            Log.e(this, new Exception(),
+                                    "Conference %s creation timeout",
+                                    getComponentName());
+                            Log.addEvent(call, LogUtils.Events.CREATE_CONFERENCE_TIMEOUT,
+                                    Log.piiHandle(call.getHandle()) + " via:" +
+                                            getComponentName().getPackageName());
+                            response.handleCreateConferenceFailure(
+                                    new DisconnectCause(DisconnectCause.ERROR));
+                        }
+                    }
+                };
+                if (mScheduledExecutor != null && !mScheduledExecutor.isShutdown()) {
+                    try {
+                        // Post cleanup to the executor service and cache the future,
+                        // so we can cancel it if needed.
+                        ScheduledFuture<?> future = mScheduledExecutor.schedule(
+                                r.getRunnableToCancel(),SERVICE_BINDING_TIMEOUT,
+                                TimeUnit.MILLISECONDS);
+                        mScheduledFutureMap.put(call, future);
+                    } catch (RejectedExecutionException e) {
+                        Log.e(this, e, "createConference: mScheduledExecutor was "
+                                + "already shutdown");
+                    }
+                } else {
+                    Log.w(this, "createConference: Scheduled executor is null or shutdown");
+                }
                 try {
                     mServiceInterface.createConference(
                             call.getConnectionManagerPhoneAccount(),
@@ -1420,7 +1512,36 @@ public class ConnectionServiceWrapper extends ServiceBinder implements
                         .setRttPipeFromInCall(call.getInCallToCsRttPipeForCs())
                         .setRttPipeToInCall(call.getCsToInCallRttPipeForCs())
                         .build();
-
+                Runnable r = new Runnable("CSW.cC", mLock) {
+                    @Override
+                    public void loggedRun() {
+                        if (!call.isCreateConnectionComplete()) {
+                            Log.e(this, new Exception(),
+                                    "Connection %s creation timeout",
+                                    getComponentName());
+                            Log.addEvent(call, LogUtils.Events.CREATE_CONNECTION_TIMEOUT,
+                                    Log.piiHandle(call.getHandle()) + " via:" +
+                                            getComponentName().getPackageName());
+                            response.handleCreateConnectionFailure(
+                                    new DisconnectCause(DisconnectCause.ERROR));
+                        }
+                    }
+                };
+                if (mScheduledExecutor != null && !mScheduledExecutor.isShutdown()) {
+                    try {
+                        // Post cleanup to the executor service and cache the future,
+                        // so we can cancel it if needed.
+                        ScheduledFuture<?> future = mScheduledExecutor.schedule(
+                                r.getRunnableToCancel(),SERVICE_BINDING_TIMEOUT,
+                                TimeUnit.MILLISECONDS);
+                        mScheduledFutureMap.put(call, future);
+                    } catch (RejectedExecutionException e) {
+                        Log.e(this, e, "createConnection: mScheduledExecutor was "
+                                + "already shutdown");
+                    }
+                } else {
+                    Log.w(this, "createConnection: Scheduled executor is null or shutdown");
+                }
                 try {
                     mServiceInterface.createConnection(
                             call.getConnectionManagerPhoneAccount(),
@@ -1830,7 +1951,8 @@ public class ConnectionServiceWrapper extends ServiceBinder implements
         }
     }
 
-    void addCall(Call call) {
+    @VisibleForTesting
+    public void addCall(Call call) {
         if (mCallIdMapper.getCallId(call) == null) {
             mCallIdMapper.addCall(call);
         }
@@ -2046,6 +2168,13 @@ public class ConnectionServiceWrapper extends ServiceBinder implements
     @Override
     protected void removeServiceInterface() {
         Log.v(this, "Removing Connection Service Adapter.");
+        if (mServiceInterface == null) {
+            // In some cases, we may receive multiple calls to
+            // remoteServiceInterface, such as when the remote process crashes
+            // (onBinderDied & onServiceDisconnected)
+            Log.w(this, "removeServiceInterface: mServiceInterface is null");
+            return;
+        }
         removeConnectionServiceAdapter(mAdapter);
         // We have lost our service connection. Notify the world that this service is done.
         // We must notify the adapter before CallsManager. The adapter will force any pending
@@ -2054,6 +2183,10 @@ public class ConnectionServiceWrapper extends ServiceBinder implements
         handleConnectionServiceDeath();
         mCallsManager.handleConnectionServiceDeath(this);
         mServiceInterface = null;
+        if (mScheduledExecutor != null) {
+            mScheduledExecutor.shutdown();
+            mScheduledExecutor = null;
+        }
     }
 
     @Override
@@ -2172,6 +2305,7 @@ public class ConnectionServiceWrapper extends ServiceBinder implements
             }
         }
         mCallIdMapper.clear();
+        mScheduledFutureMap.clear();
 
         if (mConnSvrFocusListener != null) {
             mConnSvrFocusListener.onConnectionServiceDeath(this);
@@ -2296,5 +2430,10 @@ public class ConnectionServiceWrapper extends ServiceBinder implements
         sb.append(mComponentName);
         sb.append("]");
         return sb.toString();
+    }
+
+    @VisibleForTesting
+    public void setScheduledExecutorService(ScheduledExecutorService service) {
+        mScheduledExecutor = service;
     }
 }

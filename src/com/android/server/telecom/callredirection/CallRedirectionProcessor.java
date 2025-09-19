@@ -133,6 +133,14 @@ public class CallRedirectionProcessor implements CallRedirectionCallback {
                             + mServiceType + " call redirection service");
                 }
             }
+            Log.i(this, "notifyTimeout: call redirection has timed out so "
+                    + "unbinding the connection");
+            if (mConnection != null) {
+                // We still need to call unbind even if the service disconnected.
+                mContext.unbindService(mConnection);
+                mConnection = null;
+            }
+            mService = null;
         }
 
         private class CallRedirectionServiceConnection implements ServiceConnection {
@@ -167,6 +175,20 @@ public class CallRedirectionProcessor implements CallRedirectionCallback {
             public void onNullBinding(ComponentName componentName) {
                 // Make sure we unbind the service if onBind returns null
                 Log.startSession("CRSC.oNB");
+                try {
+                    synchronized (mTelecomLock) {
+                        finishCallRedirection();
+                    }
+                } finally {
+                    Log.endSession();
+                }
+            }
+
+            @Override
+            public void onBindingDied(ComponentName componentName) {
+                // Make sure we unbind the service if binding died to avoid background stating
+                // activity leaks
+                Log.startSession("CRSC.oBD");
                 try {
                     synchronized (mTelecomLock) {
                         finishCallRedirection();
